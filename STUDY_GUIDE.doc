@@ -1,0 +1,357 @@
+<html xmlns:o="urn:schemas-microsoft-com:office:office" xmlns:w="urn:schemas-microsoft-com:office:word" xmlns="http://www.w3.org/TR/REC-html40">
+<head>
+<meta charset="utf-8">
+<title>AWS Lambda &amp; Boto3 - Study Guide</title>
+<!--[if gte mso 9]>
+<xml>
+<w:WordDocument>
+<w:View>Print</w:View>
+<w:Zoom>100</w:Zoom>
+<w:DoNotOptimizeForBrowser/>
+</w:WordDocument>
+</xml>
+<![endif]-->
+<style>
+  @page Section1 { size: 8.5in 11in; margin: 1in 1in 1in 1in; }
+  div.Section1 { page: Section1; }
+  body { font-family: Calibri, Arial, sans-serif; font-size: 11pt; color: #1a1a1a; line-height: 1.4; }
+  h1 { font-size: 22pt; color: #1a1a1a; border-bottom: 2pt solid #2E5395; padding-bottom: 6pt; }
+  h2 { font-size: 16pt; color: #2E5395; margin-top: 22pt; border-bottom: 1pt solid #ccc; padding-bottom: 3pt; }
+  h3 { font-size: 13pt; color: #2E5395; margin-top: 14pt; }
+  p { margin: 6pt 0; }
+  ul, ol { margin: 6pt 0; padding-left: 24pt; }
+  li { margin: 3pt 0; }
+  code { font-family: Consolas, "Courier New", monospace; background-color: #f0f0f0; padding: 1pt 3pt; font-size: 10pt; }
+  pre { font-family: Consolas, "Courier New", monospace; background-color: #f5f5f5; border: 1pt solid #ccc; padding: 8pt; font-size: 9.5pt; white-space: pre-wrap; margin: 8pt 0; }
+  .link-box { background-color: #eef3fb; border: 1pt solid #2E5395; padding: 10pt 14pt; margin: 10pt 0 20pt 0; }
+  .link-box a { color: #2E5395; font-weight: bold; }
+  strong { color: #1a1a1a; }
+  hr { border: none; border-top: 1pt solid #ccc; margin: 16pt 0; }
+</style>
+</head>
+<body lang="en-US">
+<div class="Section1">
+
+<h1>AWS Lambda &amp; Boto3 &#8212; Study Guide</h1>
+
+<div class="link-box">
+<p><strong>Assignment submission repository (GitHub):</strong><br>
+<a href="https://github.com/31skpandit/HeroVired_Assignment_04_AWS_Cloud_Deployment">https://github.com/31skpandit/HeroVired_Assignment_04_AWS_Cloud_Deployment</a></p>
+<p>Submitted by: Santoshkumar Pandit &nbsp;|&nbsp; PPMCAD &#8212; AWS Module, Assignment 2 (Serverless Automation with AWS Lambda &amp; Boto3)</p>
+</div>
+
+<p>Personal revision notes for the 4 completed assignments. This is separate
+from the per-task <code>README.md</code> files in the repository above (which
+are the graded submission docs) &#8212; this document is organized for
+<strong>learning and interview prep</strong>: concepts first, then the exact
+steps, then the traps that actually got hit while building these.</p>
+
+<hr>
+
+<h2>Cross-Assignment Lessons (read this section first)</h2>
+<p>These are the patterns that showed up more than once &#8212; the stuff
+worth actually remembering, not just the assignment-specific details.</p>
+
+<ol>
+<li><strong>Lambda's default timeout is 3 seconds &#8212; too short for
+almost anything that makes more than one API call.</strong> Hit this directly
+in Assignment 2 (4 buckets &times; 3 S3 calls + 1 SNS publish timed out) even
+though the logic was already correct. Fix: bump Configuration &rarr; General
+configuration &rarr; Timeout to 15&#8211;30s on any function that loops over
+resources or chains multiple AWS API calls. A single-call function (like EC2
+auto-tagging) can usually stay at the default, but there's no downside to
+raising it anyway.</li>
+
+<li><strong>S3 bucket policies must reference the exact bucket they're
+attached to.</strong> The <code>Resource</code> ARN inside the policy JSON
+has to match the bucket you're currently editing, or S3 rejects it with
+<code>"Policy has invalid resource"</code>. Easy mistake when you have
+multiple similarly-named test buckets open in different tabs &#8212; always
+check the breadcrumb/URL, not just which tab you think you're on.</li>
+
+<li><strong>Cost Explorer (<code>ce</code> client) only has an endpoint in
+<code>us-east-1</code>, regardless of which region the rest of your resources
+live in.</strong> Always hardcode <code>region_name="us-east-1"</code> when
+creating the boto3 <code>ce</code> client. Also: Cost Explorer needs to be
+manually enabled once per account and can take hours to populate historical
+data the first time &#8212; enable it early.</li>
+
+<li><strong>IAM resource-level scoping is inconsistent across
+services/actions</strong> &#8212; worth knowing case by case instead of
+assuming:
+<ul>
+<li><code>s3:ListBucket</code> / <code>s3:DeleteObject</code> &rarr; scopeable to a specific bucket ARN.</li>
+<li><code>s3:ListAllMyBuckets</code> &rarr; account-level, <strong>must</strong> be <code>Resource: "*"</code>.</li>
+<li><code>s3:GetBucketPublicAccessBlock</code> / <code>GetBucketPolicyStatus</code> / <code>GetBucketAcl</code> &rarr; scopeable to <code>arn:aws:s3:::*</code> (any bucket, but still bucket-level, not account-level <code>*</code>).</li>
+<li><code>ce:GetCostAndUsage</code> &rarr; does not support resource-level scoping at all, must be <code>"*"</code>.</li>
+<li><code>ec2:CreateTags</code> &rarr; scopeable to a resource-type ARN, e.g. <code>arn:aws:ec2:*:ACCOUNT_ID:instance/*</code> (restricts to tagging instances only, not volumes/snapshots/etc).</li>
+<li><code>ec2:DescribeInstances</code> &rarr; does not support resource-level scoping, must be <code>"*"</code>.</li>
+</ul>
+Least-privilege doesn't always mean a narrow ARN &#8212; sometimes the action
+itself is the only lever you have, and <code>"*"</code> on a single, specific
+action is still far tighter than a <code>*FullAccess</code> managed
+policy.</li>
+
+<li><strong>EC2 launch wizard defaults to <code>t2.micro</code>, not
+<code>t3.micro</code>.</strong> Both are free-tier eligible, so it's easy to
+not notice &#8212; check the instance type field before clicking Launch if
+the assignment spec calls out t3.</li>
+
+<li><strong>Test cheaply before testing for real.</strong> In Assignment 4,
+running a mock EventBridge event with a fake instance ID through the Lambda
+Test tab caught event-parsing and IAM issues <em>before</em> any real EC2
+instance was involved &#8212; it's fine (expected, even) for that mock run to
+fail on the AWS API call itself, as long as it fails at the right place.</li>
+</ol>
+
+<hr>
+
+<h2>Assignment 1 &#8212; S3 Bucket Cleanup (delete objects older than N days)</h2>
+
+<p><strong>Concept:</strong> paginate through a bucket's objects, compare
+<code>LastModified</code> (timezone-aware) against a UTC cutoff, delete
+anything older.</p>
+
+<p><strong>Why not just use S3 Lifecycle Rules?</strong> In production you
+would &#8212; this is the zero-code, native answer. Lambda earns its place
+when you need conditional logic Lifecycle can't express (naming patterns,
+cross-service side effects, custom logging) &#8212; not for a flat age-based
+deletion.</p>
+
+<p><strong>Steps:</strong></p>
+<ol>
+<li>S3 &rarr; Create bucket &rarr; defaults are fine &rarr; upload a few test files.</li>
+<li>IAM &rarr; Roles &rarr; Create role &rarr; AWS service &rarr; Lambda &rarr; skip managed policies &rarr; name it &rarr; Create role.</li>
+<li>Open the role &rarr; Add permissions &rarr; Create inline policy &rarr; JSON &rarr; paste the least-privilege policy (below) &rarr; name &rarr; Create.</li>
+<li>Lambda &rarr; Create function &rarr; Python 3.12 &rarr; attach the role from step 3.</li>
+<li>Paste the code &rarr; Deploy.</li>
+<li>Configuration &rarr; Environment variables: <code>BUCKET_NAME</code>, <code>AGE_THRESHOLD_DAYS</code> (set to <code>0</code> temporarily to prove deletion works against today's uploads).</li>
+<li>Test tab &rarr; Create event &rarr; Invoke &rarr; confirm deleted keys in the response and in CloudWatch Logs.</li>
+<li>Reset <code>AGE_THRESHOLD_DAYS</code> back to <code>30</code> for the real/final state.</li>
+</ol>
+
+<p><strong>IAM policy shape:</strong></p>
+<pre>{
+  "Version": "2012-10-17",
+  "Statement": [
+    { "Sid": "ListBucket", "Effect": "Allow", "Action": "s3:ListBucket",
+      "Resource": "arn:aws:s3:::BUCKET_NAME" },
+    { "Sid": "DeleteObjects", "Effect": "Allow", "Action": "s3:DeleteObject",
+      "Resource": "arn:aws:s3:::BUCKET_NAME/*" },
+    { "Sid": "Logs", "Effect": "Allow",
+      "Action": ["logs:CreateLogGroup","logs:CreateLogStream","logs:PutLogEvents"],
+      "Resource": "arn:aws:logs:*:*:*" }
+  ]
+}</pre>
+
+<p><strong>Core logic</strong> (full code in <code>01-s3-bucket-cleanup/lambda_function.py</code>):</p>
+<pre>cutoff = datetime.now(timezone.utc) - timedelta(days=AGE_THRESHOLD_DAYS)
+paginator = s3.get_paginator("list_objects_v2")
+for page in paginator.paginate(Bucket=BUCKET_NAME):
+    for obj in page.get("Contents", []):
+        if obj["LastModified"] &lt; cutoff:
+            s3.delete_object(Bucket=BUCKET_NAME, Key=obj["Key"])</pre>
+
+<p>Key point: <strong>always use the paginator</strong>, never assume
+<code>list_objects_v2</code> returns everything in one call (it caps at 1000
+keys per page).</p>
+
+<hr>
+
+<h2>Assignment 2 &#8212; Audit S3 Buckets for Public Access, Alert via SNS</h2>
+
+<p><strong>Concept:</strong> since April 2023, new buckets default to Block
+Public Access ON and ACLs disabled &#8212; so "is this bucket public" can't
+be answered by ACLs alone anymore. Correct check is three-part:</p>
+<ol>
+<li>Is Block Public Access <strong>fully</strong> enabled (all 4 sub-settings)?</li>
+<li>Does <code>get_bucket_policy_status</code> report <code>IsPublic: true</code>?</li>
+<li>Does the ACL grant access to <code>AllUsers</code> / <code>AuthenticatedUsers</code>?</li>
+</ol>
+<p>A bucket is actually reachable publicly only if BPA is <strong>not</strong>
+fully enabled <strong>and</strong> (policy is public <strong>or</strong> ACL
+grants public access).</p>
+
+<p><strong>Why not just use IAM/S3 Access Analyzer?</strong> It's the
+managed, continuous alternative. Custom Lambda earns its place for a specific
+alert channel/format or auto-remediation (e.g. automatically re-enabling
+BPA).</p>
+
+<p><strong>Steps:</strong></p>
+<ol>
+<li>SNS &rarr; Create topic (Standard) &rarr; Create subscription (Email) &rarr; <strong>confirm from your inbox</strong> (nothing arrives until you do this).</li>
+<li>Create 2 test buckets: one left on defaults (control), one to deliberately expose later.</li>
+<li>IAM role + inline policy (below).</li>
+<li>Lambda, Python 3.12, attach role, paste code, Deploy.</li>
+<li>Set env var <code>SNS_TOPIC_ARN</code>. <strong>Set timeout to 30s up front</strong> (see lesson #1 above).</li>
+<li>Test with both buckets private &rarr; expect <code>public_buckets: []</code>.</li>
+<li>Make the second bucket public: Permissions &rarr; Block Public Access &rarr; Edit &rarr; uncheck all 4 &rarr; confirm. Then Bucket Policy &rarr; Edit &rarr; paste a public-read policy <strong>referencing that exact bucket's ARN</strong>.</li>
+<li>Re-test &rarr; expect the bucket to appear in <code>public_buckets</code>, SNS email arrives, CloudWatch Logs show the flag.</li>
+<li><strong>Immediately re-secure</strong>: delete the bucket policy, re-enable all 4 BPA settings.</li>
+</ol>
+
+<p><strong>IAM policy shape:</strong></p>
+<pre>{
+  "Version": "2012-10-17",
+  "Statement": [
+    { "Sid": "ListAllBuckets", "Effect": "Allow", "Action": "s3:ListAllMyBuckets", "Resource": "*" },
+    { "Sid": "InspectBucketPublicStatus", "Effect": "Allow",
+      "Action": ["s3:GetBucketPublicAccessBlock","s3:GetBucketPolicyStatus","s3:GetBucketAcl"],
+      "Resource": "arn:aws:s3:::*" },
+    { "Sid": "PublishAlert", "Effect": "Allow", "Action": "sns:Publish",
+      "Resource": "arn:aws:sns:REGION:ACCOUNT_ID:TOPIC_NAME" },
+    { "Sid": "Logs", "Effect": "Allow",
+      "Action": ["logs:CreateLogGroup","logs:CreateLogStream","logs:PutLogEvents"],
+      "Resource": "arn:aws:logs:*:*:*" }
+  ]
+}</pre>
+
+<p><strong>Core logic</strong> (full code in <code>02-public-bucket-audit/lambda_function.py</code>):</p>
+<pre>is_public = (not bpa_fully_enabled) and (policy_is_public or acl_has_public_grant)</pre>
+
+<hr>
+
+<h2>Assignment 3 &#8212; Daily AWS Cost Alert (Cost Explorer + SNS)</h2>
+
+<p><strong>Concept:</strong> query month-to-date <code>UnblendedCost</code>
+via <code>ce.get_cost_and_usage</code>, compare against a threshold, alert
+via SNS if exceeded.</p>
+
+<p><strong>Why not just use AWS Budgets?</strong> It's the managed, no-code
+alternative &#8212; alerts on forecasted or actual spend out of the box.
+Custom Lambda earns its place for per-service cost breakdowns, delivery to a
+channel Budgets doesn't support, or custom anomaly logic beyond a flat
+threshold.</p>
+
+<p><strong>Steps:</strong></p>
+<ol>
+<li><strong>Enable Cost Explorer first</strong> (Billing &rarr; Cost Explorer &rarr; Enable) &#8212; do this as early as possible, first-time activation can take hours.</li>
+<li>SNS topic + confirmed email subscription.</li>
+<li>IAM role + inline policy (below).</li>
+<li>Lambda, Python 3.12, paste code, Deploy. <strong>Set timeout to 30s.</strong></li>
+<li>Env vars: <code>SNS_TOPIC_ARN</code>, <code>COST_THRESHOLD_USD=0.01</code> (low, to force an alert during testing).</li>
+<li>Test &rarr; expect <code>alert_sent: true</code> and an SNS email.</li>
+<li>Reset <code>COST_THRESHOLD_USD</code> to a realistic value (e.g. <code>50</code>).</li>
+<li><strong>Don't over-invoke</strong> &#8212; each <code>GetCostAndUsage</code> call costs &#8776;&#8377;1. 5&#8211;10 total test invocations is the guidance; no EventBridge schedule needed for grading (scheduling this daily is a real-money commitment).</li>
+</ol>
+
+<p><strong>IAM policy shape:</strong></p>
+<pre>{
+  "Version": "2012-10-17",
+  "Statement": [
+    { "Sid": "CostExplorerRead", "Effect": "Allow", "Action": "ce:GetCostAndUsage", "Resource": "*" },
+    { "Sid": "PublishAlert", "Effect": "Allow", "Action": "sns:Publish",
+      "Resource": "arn:aws:sns:us-east-1:ACCOUNT_ID:TOPIC_NAME" },
+    { "Sid": "Logs", "Effect": "Allow",
+      "Action": ["logs:CreateLogGroup","logs:CreateLogStream","logs:PutLogEvents"],
+      "Resource": "arn:aws:logs:*:*:*" }
+  ]
+}</pre>
+
+<p><strong>Core logic</strong> (full code in <code>03-daily-cost-alert/lambda_function.py</code>):</p>
+<pre>ce = boto3.client("ce", region_name="us-east-1")   # always us-east-1
+start = today.replace(day=1).isoformat()
+end = today.isoformat()
+if start == end:                                     # 1st-of-month edge case
+    end = (today + timedelta(days=1)).isoformat()
+response = ce.get_cost_and_usage(
+    TimePeriod={"Start": start, "End": end},
+    Granularity="MONTHLY",
+    Metrics=["UnblendedCost"],
+)</pre>
+
+<hr>
+
+<h2>Assignment 4 &#8212; Auto-Tag EC2 Instances on Launch</h2>
+
+<p><strong>Concept:</strong> EventBridge fires an <code>EC2 Instance
+State-change Notification</code> event whenever an instance's state changes;
+filter for <code>state: running</code>, extract <code>detail.instance-id</code>,
+apply tags via <code>ec2.create_tags</code>.</p>
+
+<p><strong>Why not a scheduled poll instead?</strong> Event-driven is
+strictly better here &#8212; tags get applied within seconds of launch
+instead of on the next poll cycle, and there's no wasted invocation when
+nothing launched.</p>
+
+<p><strong>Bonus</strong> (not implemented, but a common interview
+follow-up): to capture <em>who</em> launched the instance, add a second
+EventBridge rule matching CloudTrail's <code>RunInstances</code> API call
+event, extract <code>userIdentity.arn</code>, use it as the <code>Owner</code>
+tag instead of a static placeholder.</p>
+
+<p><strong>Steps:</strong></p>
+<ol>
+<li>IAM role + inline policy (below).</li>
+<li>Lambda, Python 3.12, attach role, paste code, Deploy.</li>
+<li>EventBridge &rarr; Create rule &rarr; Event pattern (JSON, below) &rarr; Target: the Lambda function.</li>
+<li><strong>Mock test first</strong>, before touching real EC2: Test tab with a fake <code>instance-id</code> &#8212; expect it to fail at the <code>create_tags</code> API call (that's the correct failure point, proves everything upstream works).</li>
+<li>Launch a real <strong>t3.micro</strong> instance (double-check &#8212; wizard defaults to t2.micro), no key pair needed.</li>
+<li>Wait ~30&#8211;60s after "running" &#8212; the EventBridge rule fires the Lambda automatically, <strong>no manual invoke needed</strong>.</li>
+<li>Verify tags on the instance (Tags tab) and the CloudWatch log entry.</li>
+<li><strong>Terminate immediately.</strong></li>
+</ol>
+
+<p><strong>Event pattern:</strong></p>
+<pre>{
+  "source": ["aws.ec2"],
+  "detail-type": ["EC2 Instance State-change Notification"],
+  "detail": { "state": ["running"] }
+}</pre>
+
+<p><strong>IAM policy shape:</strong></p>
+<pre>{
+  "Version": "2012-10-17",
+  "Statement": [
+    { "Sid": "TagInstancesOnly", "Effect": "Allow", "Action": "ec2:CreateTags",
+      "Resource": "arn:aws:ec2:*:ACCOUNT_ID:instance/*" },
+    { "Sid": "DescribeInstances", "Effect": "Allow", "Action": "ec2:DescribeInstances", "Resource": "*" },
+    { "Sid": "Logs", "Effect": "Allow",
+      "Action": ["logs:CreateLogGroup","logs:CreateLogStream","logs:PutLogEvents"],
+      "Resource": "arn:aws:logs:*:*:*" }
+  ]
+}</pre>
+
+<p><strong>Core logic</strong> (full code in <code>04-ec2-auto-tagging/lambda_function.py</code>):</p>
+<pre>detail = event.get("detail", {})
+instance_id = detail.get("instance-id")
+if detail.get("state") == "running":
+    ec2.create_tags(Resources=[instance_id], Tags=[
+        {"Key": "LaunchDate", "Value": date.today().isoformat()},
+        {"Key": "Owner", "Value": "auto-tag-lambda"},
+        {"Key": "Environment", "Value": "dev"},
+    ])</pre>
+
+<hr>
+
+<h2>Quick Interview-Style Q&amp;A (self-test)</h2>
+
+<p><strong>Q: Why does the S3 cleanup function use a paginator instead of
+just calling <code>list_objects_v2</code> once?</strong><br>
+A: <code>list_objects_v2</code> caps at 1000 keys per response; a paginator
+transparently walks all pages so large buckets aren't silently
+under-processed.</p>
+
+<p><strong>Q: Why does Block Public Access alone not tell you if a bucket is
+public?</strong><br>
+A: BPA controls whether public ACLs/policies are <em>allowed to take
+effect</em>, not whether one <em>exists</em>. You also need to check policy
+status and ACL grants &#8212; a bucket with BPA off but no public policy/ACL
+still isn't actually public.</p>
+
+<p><strong>Q: Why hardcode <code>us-east-1</code> for the Cost Explorer
+client?</strong><br>
+A: Cost Explorer is a global service exposed through a single regional API
+endpoint (<code>us-east-1</code>) regardless of where your billed resources
+run.</p>
+
+<p><strong>Q: Why prefer adjusting Auto Scaling Group desired capacity over
+launching/terminating raw EC2 instances from Lambda?</strong> <em>(general AWS
+pattern, not built here, but a common follow-up)</em><br>
+A: ASGs handle health checks, AZ balancing, and lifecycle hooks natively; raw
+instance management from Lambda duplicates that logic poorly and doesn't
+integrate with target groups the way ASG scaling does.</p>
+
+</div>
+</body>
+</html>
